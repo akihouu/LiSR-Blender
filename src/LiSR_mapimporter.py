@@ -16,7 +16,7 @@ import os
 from collections import defaultdict
 
 
-def build_file_index(root_dir, extensions=('.mat', '.tga')):
+def build_file_index(root_dir, extensions=('.mat', '.tga', '.props.txt')):
     """Build filename -> path mapping once for fast lookups."""
     index = {}
     for subdir, dirs, files in os.walk(root_dir):
@@ -32,6 +32,107 @@ def split_object_path(object_path):
     if len(path_parts) > 1:
         return path_parts[0]
     return object_path
+
+
+def parse_props_file(filepath):
+    """Parse a .props.txt file and extract material properties."""
+    import re
+
+    result = {
+        'blend_mode': 0,  # 0=Opaque, 1=Masked, 2=Translucent, 3=Additive
+        'two_sided': False,
+        'opacity_clip': 0.5,
+        'scalar_params': {},
+        'vector_params': {},
+    }
+
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            content = f.read()
+    except Exception:
+        return result
+
+    # Parse BlendMode = BLEND_X (N)
+    blend_match = re.search(r'BlendMode\s*=\s*BLEND_\w+\s*\((\d+)\)', content)
+    if blend_match:
+        result['blend_mode'] = int(blend_match.group(1))
+
+    # Parse TwoSided = true/false
+    twosided_match = re.search(r'TwoSided\s*=\s*(true|false)', content, re.IGNORECASE)
+    if twosided_match:
+        result['two_sided'] = twosided_match.group(1).lower() == 'true'
+
+    # Parse OpacityMaskClipValue = N
+    opacity_match = re.search(r'OpacityMaskClipValue\s*=\s*([\d.]+)', content)
+    if opacity_match:
+        result['opacity_clip'] = float(opacity_match.group(1))
+
+    # Parse ScalarParameterValues blocks
+    # Pattern: ParameterInfo = { Name=X } followed by ParameterValue = N
+    scalar_pattern = re.compile(
+        r'ParameterInfo\s*=\s*\{\s*Name\s*=\s*(\w+)\s*\}[^}]*?ParameterValue\s*=\s*([-\d.]+)',
+        re.DOTALL
+    )
+    for match in scalar_pattern.finditer(content):
+        param_name = match.group(1)
+        try:
+            param_value = float(match.group(2))
+            result['scalar_params'][param_name] = param_value
+        except ValueError:
+            pass
+
+    # Parse VectorParameterValues for colors
+    # Pattern: Value = { R=N, G=N, B=N, A=N } with Name = X
+    vector_pattern = re.compile(
+        r'Value\s*=\s*\{\s*R\s*=\s*([-\d.]+)\s*,\s*G\s*=\s*([-\d.]+)\s*,\s*B\s*=\s*([-\d.]+)\s*,\s*A\s*=\s*([-\d.]+)\s*\}[^}]*?Name\s*=\s*(\w+)',
+        re.DOTALL
+    )
+    for match in vector_pattern.finditer(content):
+        try:
+            r = float(match.group(1))
+            g = float(match.group(2))
+            b = float(match.group(3))
+            a = float(match.group(4))
+            name = match.group(5)
+            result['vector_params'][name] = (r, g, b, a)
+        except ValueError:
+            pass
+
+    # Parse TextureParameterValues for texture references
+    # Pattern: ParameterInfo = { Name=XXX } followed immediately by ParameterValue = Texture2D'...'
+    result['texture_params'] = {}
+    texture_pattern = re.compile(
+        r'ParameterInfo\s*=\s*\{\s*Name\s*=\s*([^\}]+?)\s*\}'
+        r'\s+'
+        r"ParameterValue\s*=\s*Texture2D'[^']*?/([^/']+)\.[^']*'"
+    )
+    for match in texture_pattern.finditer(content):
+        param_name = match.group(1).strip()
+        texture_name = match.group(2).strip()
+        result['texture_params'][param_name] = texture_name
+
+    return result
+
+
+def has_alpha_variation(image_path):
+    """Check if an image's alpha channel has meaningful variation (not all white).
+
+    Returns True if the alpha channel has at least 0.1 variation, indicating
+    it contains roughness data rather than being blank/white.
+    """
+    try:
+        img = bpy.data.images.load(image_path)
+        pixels = list(img.pixels)
+        # Sample alpha values (every 4th value starting at index 3)
+        alpha_samples = pixels[3::4][:1000]  # Sample first 1000 pixels for speed
+        if not alpha_samples:
+            return False
+        min_alpha = min(alpha_samples)
+        max_alpha = max(alpha_samples)
+        # If there's at least 0.1 variation, consider it valid roughness data
+        return (max_alpha - min_alpha) > 0.1
+    except Exception:
+        return False
 
 
 class MIAddonPreferences(bpy.types.AddonPreferences):
@@ -257,7 +358,7 @@ class MapImporter(bpy.types.Operator):
     _base_dir = ""
     _import_static = True
     _import_lights = False
-    _static_mesh_types = ['StaticMeshComponent']
+    _static_mesh_types = ['StaticMeshComponent', "InstancedStaticMeshComponent"]
     _light_types = ['SpotLightComponent', 'AnimatedLightComponent', 'PointLightComponent']
     _batch_size = 5
 
@@ -476,7 +577,7 @@ class MaterialImporter(bpy.types.Operator):
 
         # Build file index once - major optimization
         print("Building file index...")
-        file_index = build_file_index(mat_dir, extensions=('.mat', '.tga'))
+        file_index = build_file_index(mat_dir, extensions=('.mat', '.tga', '.props.txt'))
         print(f"Indexed {len(file_index)} files")
 
         # Build material-to-slots mapping once for fast deduplication
@@ -526,6 +627,26 @@ class MaterialImporter(bpy.types.Operator):
             if not found_file:
                 continue
 
+            # Find and parse .props.txt file for material properties
+            props_filename = mat_name + '.props.txt'
+            found_props = file_index.get(props_filename)
+            props_data = parse_props_file(found_props) if found_props else None
+
+            # Apply material-level properties from props file
+            if props_data:
+                blend_mode = props_data.get('blend_mode', 0)
+                if blend_mode == 0:  # Opaque
+                    material.blend_method = 'OPAQUE'
+                elif blend_mode == 1:  # Masked
+                    material.blend_method = 'CLIP'
+                    material.alpha_threshold = props_data.get('opacity_clip', 0.5)
+                elif blend_mode == 2:  # Translucent
+                    material.blend_method = 'BLEND'
+                elif blend_mode == 3:  # Additive
+                    material.blend_method = 'BLEND'
+
+                material.use_backface_culling = not props_data.get('two_sided', False)
+
             # Parse material file for texture names
             diffuse_texturename = ''
             normal_texturename = ''
@@ -560,10 +681,39 @@ class MaterialImporter(bpy.types.Operator):
             spec_texture_path = file_index.get(spec_texturename + '.tga') if spec_texturename else None
             rough_texture_path = file_index.get(rough_texturename + '.tga') if rough_texturename else None
 
+            # Roughness priority logic using props.txt texture references
+            texture_params = props_data.get('texture_params', {}) if props_data else {}
+            use_normal_alpha_roughness = False
+
+            # Priority 1: Dedicated RoughnessMap from props.txt (overrides .mat file)
+            if 'RoughnessMap' in texture_params:
+                props_rough_name = texture_params['RoughnessMap']
+                props_rough_path = file_index.get(props_rough_name + '.tga')
+                if props_rough_path:
+                    rough_texture_path = props_rough_path
+                    rough_texturename = props_rough_name
+
+            # Priority 2: Normal map alpha (NormalMap+Roughness indicates roughness is in alpha)
+            # This takes priority over .mat file fallback since .mat often has incorrect defaults
+            if 'NormalMap+Roughness' in texture_params:
+                # Get the normal map texture from props if available
+                props_normal_name = texture_params.get('NormalMap+Roughness')
+                props_normal_path = file_index.get(props_normal_name + '.tga') if props_normal_name else None
+                check_normal_path = props_normal_path or normal_texture_path
+                if check_normal_path and has_alpha_variation(check_normal_path):
+                    use_normal_alpha_roughness = True
+                    rough_texture_path = None  # Clear .mat roughness since we're using normal alpha
+                    # Use the props normal map if it exists
+                    if props_normal_path:
+                        normal_texture_path = props_normal_path
+
+            # Priority 3: .mat file fallback is already set above (rough_texture_path from .mat parsing)
+
             # Setup shader nodes
             self._setup_material_nodes(
                 material, diffuse_texture_path, normal_texture_path,
-                spec_texture_path, rough_texture_path
+                spec_texture_path, rough_texture_path, props_data,
+                use_normal_alpha_roughness
             )
 
         # Remove duplicate/invalid materials
@@ -583,16 +733,24 @@ class MaterialImporter(bpy.types.Operator):
         print(f'Material import complete for {collection_name}')
         return {'FINISHED'}
 
-    def _setup_material_nodes(self, material, diffuse_path, normal_path, spec_path, rough_path):
+    def _setup_material_nodes(self, material, diffuse_path, normal_path, spec_path, rough_path, props_data=None, use_normal_alpha_roughness=False):
         """Setup material shader nodes with textures."""
         if not material.node_tree:
             return
 
         is_decal = 'Decals' in material.name
+        is_additive = props_data and props_data.get('blend_mode') == 3
+
+        # Extract scalar parameters
+        scalar_params = props_data.get('scalar_params', {}) if props_data else {}
+        brightness_mult = scalar_params.get('BrightnessMult', 1.0)
+        roughness_value = scalar_params.get('Roughness', scalar_params.get('RoughnessValue1', None))
+        spec_value = scalar_params.get('Spec', scalar_params.get('Specular', None))
 
         # Node layout constants (X positions flow right to left)
         OUTPUT_X = 600
         SHADER_X = 300
+        MULTIPLY_X = 100  # For brightness multiply node
         NORMAL_MAP_X = 0
         COMBINE_X = -200
         INVERT_X = -200
@@ -613,15 +771,50 @@ class MaterialImporter(bpy.types.Operator):
                 diffuse_texture.location = (TEXTURE_X, DIFFUSE_Y)
                 diffuse_texture.image = bpy.data.images.load(diffuse_path)
                 material.node_tree.links.new(shader_node.inputs["Color"], diffuse_texture.outputs["Color"])
-        else:
-            shader_node = material.node_tree.nodes.new(type="ShaderNodeBsdfPrincipled")
+        elif is_additive:
+            # Additive materials use emission shader
+            shader_node = material.node_tree.nodes.new(type="ShaderNodeEmission")
             shader_node.location = (SHADER_X, 0)
+
+            emissive_power = scalar_params.get('EmissivePower', 1.0)
+            shader_node.inputs["Strength"].default_value = emissive_power
 
             if diffuse_path:
                 diffuse_texture = material.node_tree.nodes.new(type="ShaderNodeTexImage")
                 diffuse_texture.location = (TEXTURE_X, DIFFUSE_Y)
                 diffuse_texture.image = bpy.data.images.load(diffuse_path)
-                material.node_tree.links.new(shader_node.inputs["Base Color"], diffuse_texture.outputs["Color"])
+                material.node_tree.links.new(shader_node.inputs["Color"], diffuse_texture.outputs["Color"])
+        else:
+            shader_node = material.node_tree.nodes.new(type="ShaderNodeBsdfPrincipled")
+            shader_node.location = (SHADER_X, 0)
+
+            # Apply roughness from scalar params if no texture and not using normal alpha
+            if roughness_value is not None and not rough_path and not use_normal_alpha_roughness:
+                shader_node.inputs["Roughness"].default_value = roughness_value
+
+            # Apply specular from scalar params if no texture
+            if spec_value is not None and not spec_path:
+                shader_node.inputs["Specular IOR Level"].default_value = spec_value
+
+            if diffuse_path:
+                diffuse_texture = material.node_tree.nodes.new(type="ShaderNodeTexImage")
+                diffuse_texture.location = (TEXTURE_X, DIFFUSE_Y)
+                diffuse_texture.image = bpy.data.images.load(diffuse_path)
+
+                # Apply brightness multiplier if not 1.0
+                if brightness_mult != 1.0:
+                    multiply_node = material.node_tree.nodes.new(type="ShaderNodeMix")
+                    multiply_node.data_type = 'RGBA'
+                    multiply_node.blend_type = 'MULTIPLY'
+                    multiply_node.location = (MULTIPLY_X, DIFFUSE_Y)
+                    multiply_node.inputs["Factor"].default_value = 1.0
+                    multiply_node.inputs["B"].default_value = (brightness_mult, brightness_mult, brightness_mult, 1.0)
+
+                    material.node_tree.links.new(multiply_node.inputs["A"], diffuse_texture.outputs["Color"])
+                    material.node_tree.links.new(shader_node.inputs["Base Color"], multiply_node.outputs["Result"])
+                else:
+                    material.node_tree.links.new(shader_node.inputs["Base Color"], diffuse_texture.outputs["Color"])
+
                 material.node_tree.links.new(shader_node.inputs["Alpha"], diffuse_texture.outputs["Alpha"])
 
             if normal_path:
@@ -649,6 +842,13 @@ class MaterialImporter(bpy.types.Operator):
                 material.node_tree.links.new(normal_map_node.inputs["Color"], combine_color.outputs["Color"])
                 material.node_tree.links.new(shader_node.inputs["Normal"], normal_map_node.outputs["Normal"])
 
+                # Use normal texture's alpha channel for roughness if specified
+                if use_normal_alpha_roughness:
+                    material.node_tree.links.new(
+                        shader_node.inputs["Roughness"],
+                        normal_texture.outputs["Alpha"]
+                    )
+
             if spec_path:
                 spec_texture = material.node_tree.nodes.new(type="ShaderNodeTexImage")
                 spec_texture.location = (TEXTURE_X, SPEC_Y)
@@ -656,7 +856,7 @@ class MaterialImporter(bpy.types.Operator):
                 spec_texture.image.colorspace_settings.name = "Non-Color"
                 material.node_tree.links.new(shader_node.inputs[13], spec_texture.outputs["Color"])
 
-            if rough_path:
+            if rough_path and not use_normal_alpha_roughness:
                 rough_texture = material.node_tree.nodes.new(type="ShaderNodeTexImage")
                 rough_texture.location = (TEXTURE_X, ROUGH_Y)
                 rough_texture.image = bpy.data.images.load(rough_path)
@@ -667,7 +867,10 @@ class MaterialImporter(bpy.types.Operator):
         material_output = material.node_tree.nodes.get("Material Output")
         if material_output:
             material_output.location = (OUTPUT_X, 0)
-            material.node_tree.links.new(shader_node.outputs["BSDF"], material_output.inputs["Surface"])
+            if is_additive:
+                material.node_tree.links.new(shader_node.outputs["Emission"], material_output.inputs["Surface"])
+            else:
+                material.node_tree.links.new(shader_node.outputs["BSDF"], material_output.inputs["Surface"])
 
 
 class ImportQueueItem(bpy.types.PropertyGroup):
